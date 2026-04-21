@@ -86,4 +86,4 @@ hooks:
 # Stripped delegation context
 context:
   include:
-    - foundation:experiments/exp-lean/context/delegation-brief.md
+    - foundation:experiments/exp-lean/context/delegation-mechanics.md
