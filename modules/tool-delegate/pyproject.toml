@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "Microsoft", email = "amplifier@microsoft.com" }]
-dependencies = ["amplifier-core>=0.1.0"]
+dependencies = ["amplifier-core>=1.2.1"]
 
 [project.entry-points."amplifier.modules"]
 tool-delegate = "amplifier_module_tool_delegate:mount"

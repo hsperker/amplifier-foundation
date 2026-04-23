@@ -154,7 +154,7 @@ def scan_registered_events(content: str) -> set[str]:
             "observability.events", ["ns:event1", "ns:event2"]
         )
 
-    Pattern 2 — variable extend + register (as used in tool-delegate)::
+    Pattern 2 — variable extend + register (tool-delegate is now the counter-example, using register_contributor)::
 
         obs = coordinator.get_capability("observability.events") or []
         obs.extend(["ns:event1", "ns:event2"])
