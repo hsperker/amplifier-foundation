@@ -57,18 +57,21 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     """
     config = config or {}
 
-    # Declare observable lifecycle events for this module
-    obs_events = coordinator.get_capability("observability.events") or []
-    obs_events.extend(
-        [
-            "delegate:agent_spawned",  # When agent sub-session spawned
-            "delegate:agent_resumed",  # When agent sub-session resumed
-            "delegate:agent_completed",  # When agent sub-session completed
-            "delegate:agent_cancelled",  # When parent session is cancelled during delegation
-            "delegate:error",  # When delegation fails
-        ]
+    # Register observable lifecycle events via contribution channel.
+    # Uses register_contributor (not register_capability) so events are
+    # discoverable via collect_contributions("observability.events").
+    # See: core:docs/specs/CONTRIBUTION_CHANNELS.md
+    coordinator.register_contributor(
+        "observability.events",
+        "tool-delegate",
+        lambda: [
+            "delegate:agent_spawned",
+            "delegate:agent_resumed",
+            "delegate:agent_completed",
+            "delegate:agent_cancelled",
+            "delegate:error",
+        ],
     )
-    coordinator.register_capability("observability.events", obs_events)
 
     tool = DelegateTool(coordinator, config)
     await coordinator.mount("tools", tool, name=tool.name)
@@ -849,7 +852,56 @@ Agent usage notes:
                     ProviderPreference.from_dict(p) for p in agent_default_prefs
                 ]
 
-        # Get parent session ID
+        return await self._spawn_new_session(
+            agent_name=agent_name,
+            instruction=instruction,
+            context_depth=context_depth,
+            context_scope=context_scope,
+            context_turns=context_turns,
+            provider_preferences=provider_preferences,
+            hooks=hooks,
+            tool_call_id=tool_call_id,
+            parallel_group_id=parallel_group_id,
+            raw_model_role=raw_model_role,
+            agents=agents,
+        )
+
+    async def _spawn_new_session(
+        self,
+        agent_name: str,
+        instruction: str,
+        context_depth: str,
+        context_scope: str,
+        context_turns: int,
+        provider_preferences: list | None,
+        hooks,
+        *,
+        tool_call_id: str = "",
+        parallel_group_id: str | None = None,
+        raw_model_role: str = "",
+        agents: dict | None = None,
+    ) -> ToolResult:
+        """Spawn a new agent sub-session.
+
+        Core spawn logic extracted for testability. Called by execute() after
+        input validation; may also be called directly in tests.
+
+        Args:
+            agent_name: Agent to delegate to
+            instruction: Task instruction (may include inherited context)
+            context_depth: HOW MUCH context to inherit
+            context_scope: WHICH content to inherit
+            context_turns: Number of recent turns (when context_depth="recent")
+            provider_preferences: Resolved provider preferences list
+            hooks: Hook coordinator for event emission
+            tool_call_id: Orchestrator tool call ID (enriches event payloads)
+            parallel_group_id: Parallel group ID (enriches event payloads)
+            raw_model_role: Raw model role string for routing tracking
+            agents: Agent config dict (defaults to coordinator.config["agents"])
+
+        Returns:
+            ToolResult with spawn outcome
+        """
         parent_session_id = self.coordinator.session_id
 
         # Generate hierarchical sub-session ID (sanitized for filesystem safety)
@@ -857,6 +909,21 @@ Agent usage notes:
             agent_name=agent_name,
             parent_session_id=parent_session_id,
         )
+
+        # Resolve agents from coordinator config if not provided directly
+        if agents is None:
+            try:
+                agent_configs_raw = self.coordinator.config.get("agents", {})
+                agents = (
+                    agent_configs_raw if isinstance(agent_configs_raw, dict) else {}
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to resolve agents config, defaulting to empty: %s",
+                    e,
+                    exc_info=True,
+                )
+                agents = {}
 
         try:
             # Get spawn capability
@@ -921,14 +988,19 @@ Agent usage notes:
                 )
                 effective_instruction = f"{context_text}\n\n[YOUR TASK]\n{instruction}"
 
-            # Extract orchestrator config from parent session for inheritance
+            # Extract orchestrator config from parent session for inheritance.
+            # Guard with isinstance to handle non-dict orchestrator values gracefully
+            # (e.g. when orchestrator is a string like "loop-basic").
             orchestrator_config = None
             parent_config = parent_session.config or {}
             session_config = parent_config.get("session", {})
             orch_section = session_config.get("orchestrator", {})
-            if orch_config := orch_section.get("config"):
-                orchestrator_config = orch_config
-                logger.debug(f"Inheriting orchestrator config: {orchestrator_config}")
+            if isinstance(orch_section, dict):
+                if orch_config := orch_section.get("config"):
+                    orchestrator_config = orch_config
+                    logger.debug(
+                        f"Inheriting orchestrator config: {orchestrator_config}"
+                    )
 
             # Calculate self-delegation depth for child session
             # Named agents reset to 0, self-delegation increments
@@ -939,6 +1011,15 @@ Agent usage notes:
                 child_self_delegation_depth = current_depth + 1
             else:
                 child_self_delegation_depth = 0  # Named agents start fresh chain
+
+            # Build session metadata for child session.
+            # agent_name is always included; tool_call_id and parallel_group_id
+            # are only included when present so callers can test for key presence.
+            session_metadata: dict[str, Any] = {"agent_name": agent_name}
+            if tool_call_id:
+                session_metadata["tool_call_id"] = tool_call_id
+            if parallel_group_id:
+                session_metadata["parallel_group_id"] = parallel_group_id
 
             # Spawn agent sub-session (with optional session-level timeout)
             #
@@ -960,15 +1041,6 @@ Agent usage notes:
             # See session_spawner.py in amplifier-app-cli for the reference
             # app-layer implementation that handles all kwargs.
             # See examples/07_full_workflow.py for a minimal reference.
-            # Build session metadata for child session.
-            # agent_name is always included; tool_call_id and parallel_group_id
-            # are only included when present so callers can test for key presence.
-            session_metadata: dict[str, Any] = {"agent_name": agent_name}
-            if tool_call_id:
-                session_metadata["tool_call_id"] = tool_call_id
-            if parallel_group_id:
-                session_metadata["parallel_group_id"] = parallel_group_id
-
             spawn_coro = spawn_fn(
                 agent_name=agent_name,
                 instruction=effective_instruction,
@@ -1096,7 +1168,6 @@ Agent usage notes:
                         "parallel_group_id": parallel_group_id,
                     },
                 )
-
             return ToolResult(success=False, error={"message": error_msg})
 
     async def _resume_existing_session(
